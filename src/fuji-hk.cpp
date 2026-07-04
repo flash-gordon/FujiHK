@@ -4,12 +4,17 @@
 
 
 #define NUM_LEDS 1
-#define LED_PIN 27
+// M5 Atom S3 Lite (ESP32-S3) pin map — differs from the original Atom (ESP32):
+#define LED_PIN 35        // on-board WS2812C RGB LED (was 27 on Atom)
 #define LED_BRIGHTNESS 1
-#define BTN_PIN 39
+#define BTN_PIN 41        // front button (was 39 on Atom)
 
-#define RX_PIN 19
-#define TX_PIN 22
+// LIN transceiver UART. This unit plugs into the FOSV Fuji-Atom-Interface PCB,
+// which wires the MCP2025 to the Atom's G19(RX)/G22(TX) header pins. On the
+// AtomS3 Lite those physical header positions are different GPIOs; per the FOSV
+// pin map (Atom G19 -> AtomS3 G6, Atom G22 -> AtomS3 G5):
+#define RX_PIN 6          // FOSV: Atom G19 (RX) -> AtomS3 Lite G6
+#define TX_PIN 5          // FOSV: Atom G22 (TX) -> AtomS3 Lite G5
 
 #define COLOR_RED       255,0,0
 #define COLOR_GREEN     0,255,0
@@ -67,6 +72,34 @@ enum class CurrentHeatingCoolerState {
 char sn[32];
 char acName[64];
 
+// --- Fan speed mapping (Home Assistant <-> Fujitsu) --------------------------
+// HA's HomeKit integration exposes ANY HeaterCooler fan as exactly three speeds
+// (Low/Medium/High) and writes RotationSpeed 33/66/100%. Reading back, HA shows
+// High for >66%, Medium for >33%, Low for >0%, else Off. Only three speeds are
+// selectable, so per user's choice HA maps to Fuji Quiet / Low / High:
+//   HA Low  (~33) -> Quiet(1)
+//   HA Med  (~66) -> Low(2)
+//   HA High (100) -> High(4)
+// Range-based, so it works whether HA sends 33/66/100 (step 1) or a 25-rounded
+// 25/75/100 (older cached step). Medium(3)/Auto(0) aren't selectable from HA but
+// still display sensibly and are settable from the wall remote.
+int fanModeToRotation(byte fanMode) {
+  switch(fanMode) {
+    case static_cast<byte>(FujiFanMode::FAN_QUIET):  return 33;   // shows as HA Low
+    case static_cast<byte>(FujiFanMode::FAN_LOW):    return 66;   // shows as HA Medium
+    case static_cast<byte>(FujiFanMode::FAN_MEDIUM): return 100;  // shows as HA High
+    case static_cast<byte>(FujiFanMode::FAN_HIGH):   return 100;  // shows as HA High
+    default:                                         return 0;    // FAN_AUTO -> HA Off
+  }
+}
+
+byte rotationToFanMode(int rotation) {
+  if(rotation == 0)  return static_cast<byte>(FujiFanMode::FAN_AUTO);   // HA Off
+  if(rotation <= 49) return static_cast<byte>(FujiFanMode::FAN_QUIET);  // HA Low  (~25/33)
+  if(rotation <= 82) return static_cast<byte>(FujiFanMode::FAN_LOW);    // HA Med  (~66/75)
+  return static_cast<byte>(FujiFanMode::FAN_HIGH);                      // HA High (~100)
+}
+
 
 struct FujitsuHK : Service::HeaterCooler { 
 
@@ -116,8 +149,8 @@ struct FujitsuHK : Service::HeaterCooler {
       
       temperatureDisplayUnits = new Characteristic::TemperatureDisplayUnits(0);
 
-      rotationSpeed = new Characteristic::RotationSpeed(currentState.isBound ? currentState.fanMode*25 : 0);
-      rotationSpeed->setRange(0,100,25);
+      rotationSpeed = new Characteristic::RotationSpeed(currentState.isBound ? fanModeToRotation(currentState.fanMode) : 0);
+      rotationSpeed->setRange(0,100,1);
       
     } // end constructor
 
@@ -181,11 +214,12 @@ struct FujitsuHK : Service::HeaterCooler {
       }
 
       byte fanMode = currentState.fanMode;
-      
-      if(fanMode >= 0 && fanMode <= 4) {
-        if(rotationSpeed->getVal()/25 != fanMode) {
-          Serial.printf("loop(): Remote updated fanSpeed -> %d\n", fanMode);
-          rotationSpeed->setVal(fanMode*25);
+
+      if(fanMode <= 4) {
+        int wantRotation = fanModeToRotation(fanMode);
+        if(rotationSpeed->getVal() != wantRotation) {
+          Serial.printf("loop(): Remote updated fanSpeed -> %d (rotation %d)\n", fanMode, wantRotation);
+          rotationSpeed->setVal(wantRotation);
         }
       }
 
@@ -326,24 +360,7 @@ struct FujitsuHK : Service::HeaterCooler {
           
           if(xSemaphoreTake(pendingMutex, ( TickType_t ) 200 ) == pdTRUE) {
             pendingFields |= kFanModeUpdateMask;
-            
-            switch(rotationSpeed->getNewVal()){
-              case 0:
-                pendingState.fanMode = static_cast<byte>(FujiFanMode::FAN_AUTO);
-                break;
-              case 25:
-                pendingState.fanMode = static_cast<byte>(FujiFanMode::FAN_QUIET);
-                break;
-              case 50:
-                pendingState.fanMode = static_cast<byte>(FujiFanMode::FAN_LOW);
-                break;
-              case 75:
-                pendingState.fanMode = static_cast<byte>(FujiFanMode::FAN_MEDIUM);
-                break;
-              case 100:
-                pendingState.fanMode = static_cast<byte>(FujiFanMode::FAN_HIGH);
-                break;
-            }
+            pendingState.fanMode = rotationToFanMode(rotationSpeed->getNewVal());
             xSemaphoreGive(pendingMutex);
           }
         }
@@ -408,7 +425,7 @@ void FujiTaskLoop(void *pvParameters){
 
   Serial.print("Creating FujiHeatPump object\n");
   hp.connect(&Serial2, true, RX_PIN, TX_PIN);
-    
+
   for(;;){
       if(xSemaphoreTake(pendingMutex, (TickType_t)200) == pdTRUE) {
         if(pendingFields) {
